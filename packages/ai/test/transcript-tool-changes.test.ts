@@ -12,7 +12,10 @@ function tool(name: string): Tool {
 async function capturePayload<T>(model: Model<Api>, context: Context): Promise<T> {
 	let captured: T | undefined;
 	const stream = streamSimple(model, context, {
-		apiKey: "test-key",
+		apiKey:
+			model.api === "openai-codex-responses"
+				? `header.${btoa(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "account" } }))}.signature`
+				: "test-key",
 		onPayload: (payload) => {
 			captured = payload as T;
 			throw new PayloadCaptured();
@@ -316,6 +319,139 @@ describe("transcript system messages", () => {
 		expect(payload.input.filter((item) => item.role === "developer")).toHaveLength(2);
 	});
 
+	describe.each(["openai-responses", "openai-codex-responses"] as const)("%s replay baselines", (api) => {
+		test.each([
+			{ capability: "supportsAdditionalTools", additionType: "additional_tools", addedName: "discovered_tool" },
+			{ capability: "supportsAdditionalTools", additionType: "additional_tools", addedName: "base_tool" },
+			{ capability: "supportsToolSearch", additionType: "tool_search_output", addedName: "discovered_tool" },
+			{ capability: "supportsToolSearch", additionType: "tool_search_output", addedName: "base_tool" },
+		] as const)("anchors $addedName with $capability", async ({ capability, additionType, addedName }) => {
+			const model: Model<typeof api> = {
+				...modelBase,
+				id: "dynamic-tools-test",
+				name: "Dynamic tools test",
+				api,
+				provider: api === "openai-codex-responses" ? "openai-codex" : "openai",
+				compat: { supportsMidConvoSystemMessages: true, [capability]: true },
+			};
+			type Payload = {
+				tools: Array<{ name: string }>;
+				input: Array<{ type?: string; tools?: Array<{ name: string }> }>;
+			};
+			const baseline = await capturePayload<Payload>(model, context);
+			const extended = await capturePayload<Payload>(model, {
+				messages: [
+					...context.messages,
+					{ role: "user", content: "discover another tool", timestamp: 3 },
+					{ role: "system", content: "", toolsAdded: [tool(addedName)], timestamp: 4 },
+				],
+			});
+
+			expect(baseline.tools.map((value) => value.name)).toEqual(["late_tool"]);
+			expect(extended.tools).toEqual(baseline.tools);
+			expect(extended.input.slice(0, baseline.input.length)).toEqual(baseline.input);
+			expect(extended.input.filter((item) => item.type === additionType)).toEqual([
+				expect.objectContaining({ tools: [expect.objectContaining({ name: addedName })] }),
+			]);
+		});
+
+		test("preserves the prefix after a same-name schema replacement", async () => {
+			const model: Model<typeof api> = {
+				...modelBase,
+				id: "dynamic-tools-test",
+				name: "Dynamic tools test",
+				api,
+				provider: api === "openai-codex-responses" ? "openai-codex" : "openai",
+				compat: { supportsMidConvoSystemMessages: true, supportsAdditionalTools: true },
+			};
+			const replacement: Tool = {
+				...baseTool,
+				description: "base tool version two",
+				parameters: Type.Object({ value: Type.String() }),
+			};
+			const replaced: Context = {
+				messages: [
+					...additionContext.messages,
+					{ role: "system", content: "", toolsAdded: [replacement], timestamp: 3 },
+				],
+			};
+			type Payload = {
+				tools: Array<{ name: string; description: string; parameters: unknown }>;
+				input: Array<{ type?: string; tools?: Array<{ name: string }> }>;
+			};
+			const baseline = await capturePayload<Payload>(model, replaced);
+			const extended = await capturePayload<Payload>(model, {
+				messages: [
+					...replaced.messages,
+					{ role: "user", content: "discover another tool", timestamp: 4 },
+					{ role: "system", content: "", toolsAdded: [tool("discovered_tool")], timestamp: 5 },
+				],
+			});
+
+			expect(baseline.tools.map((value) => value.name)).toEqual(["base_tool", "late_tool"]);
+			expect(baseline.tools[0]).toMatchObject({
+				description: "base tool version two",
+				parameters: { required: ["value"], properties: { value: { type: "string" } } },
+			});
+			expect(baseline.input.some((item) => item.type === "additional_tools")).toBe(false);
+			expect(extended.tools).toEqual(baseline.tools);
+			expect(extended.input.slice(0, baseline.input.length)).toEqual(baseline.input);
+			expect(
+				extended.input.find((item) => item.type === "additional_tools")?.tools?.map((value) => value.name),
+			).toEqual(["discovered_tool"]);
+		});
+	});
+
+	test("starts a new baseline at the latest removal without replaying earlier additions", async () => {
+		const model: Model<"openai-responses"> = {
+			...modelBase,
+			id: "dynamic-tools-test",
+			name: "Dynamic tools test",
+			api: "openai-responses",
+			provider: "openai",
+			compat: { supportsMidConvoSystemMessages: true, supportsAdditionalTools: true },
+		};
+		const payload = await capturePayload<{
+			tools: Array<{ name: string }>;
+			input: Array<{ type?: string; tools?: Array<{ name: string }> }>;
+		}>(model, {
+			messages: [
+				...context.messages,
+				{ role: "system", content: "", toolsAdded: [tool("second_tool")], timestamp: 3 },
+				{ role: "user", content: "remove the second tool", timestamp: 4 },
+				{ role: "system", content: "", toolsRemoved: [{ name: "second_tool" }], timestamp: 5 },
+				{ role: "system", content: "", toolsAdded: [tool("third_tool")], timestamp: 6 },
+			],
+		});
+
+		expect(payload.tools.map((value) => value.name)).toEqual(["late_tool"]);
+		expect(payload.input.filter((item) => item.type === "additional_tools")).toEqual([
+			expect.objectContaining({ tools: [expect.objectContaining({ name: "third_tool" })] }),
+		]);
+	});
+
+	test("keeps later additions in the current list when in-place tools are unsupported", async () => {
+		const model: Model<"openai-responses"> = {
+			...modelBase,
+			id: "gpt-4.1",
+			name: "GPT-4.1",
+			api: "openai-responses",
+			provider: "openai",
+		};
+		const payload = await capturePayload<{
+			tools: Array<{ name: string }>;
+			input: Array<{ type?: string }>;
+		}>(model, {
+			messages: [
+				...context.messages,
+				{ role: "system", content: "", toolsAdded: [tool("discovered_tool")], timestamp: 3 },
+			],
+		});
+
+		expect(payload.tools.map((value) => value.name)).toEqual(["late_tool", "discovered_tool"]);
+		expect(payload.input.some((item) => item.type === "additional_tools")).toBe(false);
+	});
+
 	test("anchors Kimi additions in tool-bearing system messages", async () => {
 		const model: Model<"openai-completions"> = {
 			...modelBase,
@@ -337,6 +473,34 @@ describe("transcript system messages", () => {
 		expect(payload.messages.filter((message) => message.role === "system").map((message) => message.content)).toEqual(
 			["base prompt", undefined, "updated guidance"],
 		);
+	});
+
+	test("preserves Kimi's prefix when tools are added after a removal", async () => {
+		const model: Model<"openai-completions"> = {
+			...modelBase,
+			id: "kimi-k3",
+			name: "Kimi K3",
+			api: "openai-completions",
+			provider: "moonshotai",
+			compat: { supportsMidConvoSystemMessages: true, supportsMidConvoToolAdditions: true },
+		};
+		const baseline = await capturePayload<KimiPayload>(model, context);
+		const extended = await capturePayload<KimiPayload>(model, {
+			messages: [
+				...context.messages,
+				{ role: "user", content: "discover another tool", timestamp: 3 },
+				{ role: "system", content: "", toolsAdded: [tool("discovered_tool")], timestamp: 4 },
+			],
+		});
+
+		expect(baseline.tools?.map((value) => value.function?.name)).toEqual(["late_tool"]);
+		expect(extended.tools).toEqual(baseline.tools);
+		expect(extended.messages.slice(0, baseline.messages.length)).toEqual(baseline.messages);
+		expect(extended.messages.filter((message) => message.tools !== undefined)).toEqual([
+			expect.objectContaining({
+				tools: [expect.objectContaining({ function: expect.objectContaining({ name: "discovered_tool" }) })],
+			}),
+		]);
 	});
 
 	type KimiPayload = {

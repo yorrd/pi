@@ -1248,12 +1248,13 @@ export function convertMessages(
 		}
 
 		if (msg.role === "system") {
-			const addedTools = i > 0 && transcriptTools.anchorsAdditions ? (msg.toolsAdded ?? []) : [];
+			const addedTools = transcriptTools.toolAdditions.get(msg) ?? [];
 			if (addedTools.length > 0) {
 				const kimiToolMessage: KimiToolSystemMessageParam = {
 					role: "system",
 					tools: convertTools(addedTools, compat),
 				};
+				// SAFETY: Kimi accepts tool-bearing system messages, which the OpenAI SDK does not model.
 				params.push(kimiToolMessage as unknown as ChatCompletionMessageParam);
 			}
 			const text = i === 0 ? getSystemMessageText(msg) : renderSystemMessageUpdate(msg);

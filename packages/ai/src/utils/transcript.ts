@@ -213,25 +213,35 @@ export function hasNonAdditiveToolChanges(messages: TranscriptMessages): boolean
 export interface TranscriptTools {
 	/** Tools sent in the top-level request field. */
 	requestTools: Tool[];
-	/**
-	 * Whether later system messages carry their own `toolsAdded` as in-place additions.
-	 * When false, `requestTools` already holds the complete current tool set.
-	 */
-	anchorsAdditions: boolean;
+	/** Tool additions emitted at their system message, after the latest top-level baseline. */
+	toolAdditions: ReadonlyMap<SystemMessage, Tool[]>;
 }
 
 /**
- * Split tool declarations between the top-level request field and in-place additions.
- * Transports that can anchor additions at a system message keep the initial tools at the
- * top and load later ones where they appear; that only works when no tool was removed or
- * redeclared, so everything else sends the current tool list.
+ * Split tool declarations between a stable top-level baseline and in-place additions.
+ * A removal or redeclaration requires a new baseline through that system message, since
+ * addition-only transports cannot express it inline. Later additions can still be anchored
+ * where they appear, without changing the baseline or any earlier request content.
  */
 export function resolveTranscriptTools(messages: TranscriptMessages, supportsToolAdditions: boolean): TranscriptTools {
-	const anchorsAdditions = supportsToolAdditions && !hasNonAdditiveToolChanges(messages);
-	return {
-		requestTools: anchorsAdditions
-			? (getInitialSystemMessage(messages)?.toolsAdded ?? [])
-			: getCurrentTools(messages),
-		anchorsAdditions,
-	};
+	const toolAdditions = new Map<SystemMessage, Tool[]>();
+	if (!supportsToolAdditions) return { requestTools: getCurrentTools(messages), toolAdditions };
+
+	const current = new Map<string, Tool>();
+	let requestTools: Tool[] = [];
+	for (const [index, message] of messages.entries()) {
+		if (!isSystemMessage(message)) continue;
+		const added = message.toolsAdded ?? [];
+		const removed = message.toolsRemoved ?? [];
+		const resetsBaseline = index === 0 || removed.length > 0 || added.some((tool) => current.has(tool.name));
+		for (const tool of removed) current.delete(tool.name);
+		for (const tool of added) current.set(tool.name, tool);
+		if (resetsBaseline) {
+			requestTools = [...current.values()];
+			toolAdditions.clear();
+		} else if (added.length > 0) {
+			toolAdditions.set(message, added);
+		}
+	}
+	return { requestTools, toolAdditions };
 }

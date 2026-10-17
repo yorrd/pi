@@ -441,11 +441,11 @@ export class AgentSession {
 	private _extensionRunnerRef?: { current?: ExtensionRunner };
 	private _initialActiveToolNames?: string[];
 	/**
-	 * Tools of the restored or reloaded loadout that are not registered yet, such as tools of MCP
-	 * servers that are still connecting. They are activated when they are registered, and dropped when
-	 * `setActiveToolsByName()` deactivates a tool or the next agent run starts.
+	 * Ordered restored or reloaded loadout, including tools that have not registered yet. Keep its
+	 * order until the next run so late registrations do not reorder the prompt or declarations.
+	 * An explicit replacement loadout cancels restoration.
 	 */
-	private _pendingToolNames = new Set<string>();
+	private _restoredToolNames = new Set<string>();
 	private _usesDefaultTools: boolean;
 	private _defaultToolModifiers: string[];
 	/** Matches the `--tools` entries: tool names or patterns. */
@@ -1277,6 +1277,7 @@ export class AgentSession {
 			return;
 		}
 
+		// SAFETY: Both messages are objects; this view only clears own keys before copying the replacement.
 		const targetRecord = target as unknown as Record<string, unknown>;
 		for (const key of Object.keys(targetRecord)) {
 			delete targetRecord[key];
@@ -1523,15 +1524,14 @@ export class AgentSession {
 	setActiveToolsByName(toolNames: string[]): void {
 		const previous = this.getActiveToolNames();
 		this._setActiveTools(toolNames);
-		// A loadout that deactivates a tool replaces the restored one, whose pending tools are dropped.
+		// An empty loadout or one that deactivates a tool cancels restoration, including pending tools.
 		// One that only adds tools, like activating tool_search, keeps them.
 		const active = new Set(this.getActiveToolNames());
-		if (previous.some((name) => !active.has(name))) this._pendingToolNames.clear();
+		if (toolNames.length === 0 || previous.some((name) => !active.has(name))) this._restoredToolNames.clear();
 	}
 
 	private _setActiveTools(toolNames: string[]): void {
 		const tools = this._applyToolLoadout(toolNames);
-		for (const tool of tools) this._pendingToolNames.delete(tool.name);
 		this._rebuildSystemPrompt(tools.map((tool) => tool.name));
 	}
 
@@ -1813,14 +1813,14 @@ export class AgentSession {
 	 * @param modifiers `+name`/`-name` entries applied to the restored loadout.
 	 */
 	private _restoreToolsFromTranscript(modifiers: readonly string[] = []): void {
-		this._pendingToolNames.clear();
+		this._restoredToolNames.clear();
 		const current = getCurrentSystemMessage(this.sessionManager.buildSessionContext().messages);
 		if (!current) return;
 		const names = applyToolModifiers(
 			(current.toolsAdded ?? []).map((tool) => tool.name),
 			modifiers,
 		);
-		this._pendingToolNames = new Set(names.filter((name) => this._isAllowedTool(name)));
+		this._restoredToolNames = new Set(names.filter((name) => this._isAllowedTool(name)));
 		this._setActiveTools(names);
 	}
 
@@ -1856,9 +1856,9 @@ export class AgentSession {
 		// Compaction before the prompt may have scheduled a retry; the new prompt replaces it.
 		this._failedResponse = undefined;
 		this._recordSelection();
-		// The run records the loadout in the transcript; restored tools that did not register by now
-		// are dropped, so a tool that never registers does not stay pending.
-		this._pendingToolNames.clear();
+		// The run records the loadout in the transcript; tools that did not register by now
+		// must not be restored by a later registry refresh.
+		this._restoredToolNames.clear();
 		try {
 			await this.agent.prompt(messages);
 			while (!this._agentRunAbortRequested) {
@@ -3616,10 +3616,8 @@ export class AgentSession {
 				}
 			}
 		}
-		// Pending tools that are registered now become active.
-		nextActiveToolNames.push(...this._pendingToolNames);
-
-		this._setActiveTools([...new Set(nextActiveToolNames)]);
+		// Preserve restored order as pending tools register, then append newly activated tools.
+		this._setActiveTools([...new Set([...this._restoredToolNames, ...nextActiveToolNames])]);
 	}
 
 	/** Whether activating the tool declares it to the model. */
@@ -3708,7 +3706,7 @@ export class AgentSession {
 		// during the session stay disabled unless the setting newly adds them.
 		const addedDefaultTools = getDefaultTools().filter((name) => !previousDefaultTools.has(name));
 		// Tools the new extensions register later, such as MCP tools, are pending until then.
-		for (const name of this.getActiveToolNames()) this._pendingToolNames.add(name);
+		for (const name of this.getActiveToolNames()) this._restoredToolNames.add(name);
 		this._buildRuntime({
 			activeToolNames: [...this.getActiveToolNames(), ...addedDefaultTools],
 			flagValues: previousFlagValues,
